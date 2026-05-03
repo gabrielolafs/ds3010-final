@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #map { height: 100%; width: 100%; }
+
+    .popup-content { font-family: sans-serif; min-width: 160px; }
+    .popup-city    { font-size: 14px; color: #555; margin-bottom: 4px; }
+    .popup-risk    { font-size: 22px; font-weight: bold; }
+    .popup-score   { font-size: 11px; color: #aaa; margin-top: 4px; }
+    .popup-loading { font-size: 14px; color: #888; }
+
+    .Low      { color: #2e7d32; }
+    .Moderate { color: #f57c00; }
+    .High     { color: #c62828; }
+    .Critical { color: #4a0000; }
+
+    #banner {
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        z-index: 1000;
+        background: rgba(0, 0, 0, 0.85);
+        color: white;
+        text-align: center;
+        padding: 12px;
+        font-family: sans-serif;
+        font-size: 14px;
+        pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="banner">
+    <h2>US Illness Risk Map</h1>
+    <p>click anywhere in the US to see how likely you are to get sick today</p>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const BASE = "http://127.0.0.1:8007";
+
+    const map = L.map('map', { zoomControl: false, worldCopyJump: false, maxBoundsViscosity: 1.0 }).setView([39.5, -98.35], 4);
+
+    L.control.zoom({ position: 'bottomleft' }).addTo(map);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // US mask
+    fetch("https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json")
+      .then(r => r.json())
+      .then(us => {
+        // world box as the outer ring
+        const worldRing = [[-180,-90],[180,-90],[180,90],[-180,90],[-180,-90]];
+
+        // collect all US rings to punch out
+        const holes = [];
+        us.features.forEach(f => {
+          const g = f.geometry;
+          if (g.type === "Polygon") {
+            holes.push(g.coordinates[0]);
+          } else if (g.type === "MultiPolygon") {
+            g.coordinates.forEach(poly => holes.push(poly[0]));
+          }
+        });
+
+        const mask = {
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [worldRing, ...holes]
+          }
+        };
+
+        L.geoJSON(mask, {
+          style: {
+            color: "none",
+            fillColor: "#000",
+            fillOpacity: 0.5,
+            interactive: false
+          }
+        }).addTo(map);
+      });
+
+    map.on('click', async (e) => {
+      const { lat, lng } = e.latlng;
+
+      function animateLoading(popup) {
+            const states = ["Predicting .", "Predicting ..", "Predicting ..."];
+            let i = 0;
+            const interval = setInterval(() => {
+                i = (i + 1) % states.length;
+                const el = popup.getElement()?.querySelector(".popup-loading");
+                if (el) el.textContent = states[i];
+                else clearInterval(interval);
+            }, 400);
+            return interval;
+        }
+
+      const popup = L.popup()
+        .setLatLng(e.latlng)
+        .setContent(`<div class="popup-content"><div class="popup-loading">Predicting .</div></div>`)
+        .openOn(map);
+
+    const loader = animateLoading(popup);
+
+      // Reverse geocode
+      let placeName = `${lat.toFixed(2)}, ${lng.toFixed(2)}`;
+      try {
+        const geo = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`
+        ).then(r => r.json());
+        const a = geo.address;
+        placeName = a.city || a.town || a.village || a.county || placeName;
+
+        const STATE_ABBR = {
+            "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA",
+            "Colorado":"CO","Connecticut":"CT","Delaware":"DE","Florida":"FL","Georgia":"GA",
+            "Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN","Iowa":"IA",
+            "Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD",
+            "Massachusetts":"MA","Michigan":"MI","Minnesota":"MN","Mississippi":"MS",
+            "Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV","New Hampshire":"NH",
+            "New Jersey":"NJ","New Mexico":"NM","New York":"NY","North Carolina":"NC",
+            "North Dakota":"ND","Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA",
+            "Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD","Tennessee":"TN",
+            "Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA",
+            "West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY","District of Columbia":"DC"
+        };
+
+        state = STATE_ABBR[a.state] || a.state || "";
+      } catch {}
+
+      // Run prediction
+      try {
+        const res = await fetch(`${BASE}/predict`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lat, lon: lng })
+        }).then(r => r.json());
+
+        clearInterval(loader);
+
+        if (res.error) {
+          popup.setContent(`<div class="popup-content"><div class="popup-loading">${res.error}</div></div>`);
+        } else {
+          popup.setContent(`
+            <div class="popup-content">
+              <div class="popup-city">${placeName}, ${state}</div>
+              <div class="popup-risk ${res.category}">${res.category} Risk</div>
+              <div class="popup-score">score: ${res.score}</div>
+            </div>
+          `);
+        }
+      } catch {
+        clearInterval(loader);
+        popup.setContent(`<div class="popup-content"><div class="popup-loading">prediction failed</div></div>`);
+      }
+    });
+  </script>
+</body>
+</html>
